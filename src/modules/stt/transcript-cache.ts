@@ -14,6 +14,8 @@
 // could land on a node without the entry; it degrades to today's behavior (untranscribed), never to
 // wrong text. A durable fix belongs in the DB, alongside a fork/upstream write-back route.
 
+import logger from "@/api/lib/logger";
+
 const TTL_MS = 30 * 60 * 1000;
 const MAX_ENTRIES = 500;
 
@@ -45,6 +47,10 @@ export function recallTranscription(messageId: number): string | null {
     cache.delete(messageId);
     return null;
   }
+  logger.info(
+    "stt: transcription recovered from the in-process cache (msg=%d)",
+    messageId,
+  );
   return entry.text;
 }
 

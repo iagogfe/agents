@@ -5,7 +5,7 @@ import { AppError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
-import { rememberTranscription } from "./transcript-cache";
+import { rememberTranscription } from "@/modules/stt/transcript-cache";
 import { cleanTranscription } from "@/modules/chatwoot/render";
 import {
   emitFlowEvent,
