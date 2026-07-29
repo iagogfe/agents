@@ -20,6 +20,10 @@ const REQUEST_TIMEOUT_MS = 15_000;
 // voice notes are small; 25 MB is generous headroom.
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
+// Backoff for the attachment 404 window (Chatwoot fires the webhook before Sidekiq writes the media
+// to storage). ~7s total, well inside the STT stage budget and the debounce window.
+const ATTACHMENT_RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
+
 // A shorter ceiling for interactive reads (the conversation-detail UI). The default 15s is fine for
 // background/agent calls, but an operator clicking a conversation must not hang 15s when Chatwoot is
 // slow/unreachable — fail fast so the caller can degrade gracefully (serve metadata + a retry).
@@ -115,12 +119,17 @@ function parseWebWidgetInbox(res: unknown): WebWidgetInbox | null {
 export class ChatwootClient {
   private readonly fetchImpl: typeof fetch;
   private readonly accountBase: string;
+  // Same injection point as createChatwootClient's baseUrl check, so downloadAttachment's guard is
+  // stubbable in tests (it used the imported guard directly, which made it untestable offline).
+  private readonly assertSafe: (url: string) => Promise<URL>;
 
   constructor(
     private readonly config: ChatwootClientConfig,
     fetchImpl: typeof fetch,
+    assertSafe: (url: string) => Promise<URL> = assertSafeOutboundUrl,
   ) {
     this.fetchImpl = fetchImpl;
+    this.assertSafe = assertSafe;
     const root = config.baseUrl.replace(/\/+$/, "");
     this.accountBase = `${root}/api/v1/accounts/${config.accountId}`;
   }
@@ -623,14 +632,35 @@ export class ChatwootClient {
   async downloadAttachment(
     dataUrl: string,
   ): Promise<{ bytes: ArrayBuffer; contentType: string | null }> {
-    await assertSafeOutboundUrl(dataUrl);
+    await this.assertSafe(dataUrl);
     let sameHost = false;
     try {
       sameHost = new URL(dataUrl).host === new URL(this.config.baseUrl).host;
     } catch {
       throw new ChatwootApiError(400, "GET attachment");
     }
-    const res = await this.fetchImpl(dataUrl, {
+    // Chatwoot creates the message (and fires the webhook) BEFORE Sidekiq finishes downloading the
+    // media from the WhatsApp Cloud API, so the blob row exists (blobs/redirect 302s) while the file
+    // is not on disk yet — the redirect target then 404s and the voice note is lost for that turn.
+    // Observed live: webhook at T, our GET at T+1s → 404; the same URL serves 200 a minute later.
+    // Retry the not-yet-written window with a short backoff; other statuses fail on the first try.
+    let res = await this.fetchAttachment(dataUrl, sameHost);
+    for (const delayMs of ATTACHMENT_RETRY_DELAYS_MS) {
+      if (res.status !== 404) break;
+      await Bun.sleep(delayMs);
+      res = await this.fetchAttachment(dataUrl, sameHost);
+    }
+    if (!res.ok) throw new ChatwootApiError(res.status, "GET attachment");
+    const bytes = await res.arrayBuffer();
+    if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+      throw new ChatwootApiError(413, "GET attachment");
+    }
+    return { bytes, contentType: res.headers.get("content-type") };
+  }
+
+  // One attempt of the attachment GET (see downloadAttachment for the retry rationale).
+  private fetchAttachment(dataUrl: string, sameHost: boolean): Promise<Response> {
+    return this.fetchImpl(dataUrl, {
       method: "GET",
       headers: sameHost
         ? { [CHATWOOT_AUTH_HEADER]: this.config.adminToken }
@@ -638,12 +668,6 @@ export class ChatwootClient {
       redirect: "follow",
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
-    if (!res.ok) throw new ChatwootApiError(res.status, "GET attachment");
-    const bytes = await res.arrayBuffer();
-    if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
-      throw new ChatwootApiError(413, "GET attachment");
-    }
-    return { bytes, contentType: res.headers.get("content-type") };
   }
 
   // The account's display name (admin token). `GET /api/v1/accounts/:id` (the account-base root)
@@ -1064,7 +1088,7 @@ export async function createChatwootClient(
 ): Promise<ChatwootClient> {
   const assertSafe = deps.assertSafe ?? assertSafeOutboundUrl;
   await assertSafe(config.baseUrl);
-  return new ChatwootClient(config, deps.fetchImpl ?? fetch);
+  return new ChatwootClient(config, deps.fetchImpl ?? fetch, assertSafe);
 }
 
 // Fetches the token owner's profile via the USER-scoped endpoint (`/api/v1/profile`, NOT

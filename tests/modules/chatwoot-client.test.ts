@@ -290,6 +290,67 @@ describe("ChatwootClient", () => {
     expect(calls[0]?.url).toContain("/inboxes/8");
   });
 
+  test("downloadAttachment retries while the media is not written yet (404)", async () => {
+    // Chatwoot fires the webhook before Sidekiq writes the WhatsApp media to storage: the first
+    // GETs 404 and a later one serves the file. Two 404s then a 200 ⇒ three calls, bytes returned.
+    const statuses = [404, 404, 200];
+    let call = 0;
+    const fetchImpl = (async () => {
+      const status = statuses[call++] ?? 200;
+      return {
+        ok: status === 200,
+        status,
+        arrayBuffer: async () => new ArrayBuffer(3),
+        headers: { get: () => "audio/ogg" },
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    const out = await client.downloadAttachment(
+      "https://chat.example.com/rails/active_storage/blobs/redirect/x/File.ogg",
+    );
+    expect(call).toBe(3);
+    expect(out.bytes.byteLength).toBe(3);
+    expect(out.contentType).toBe("audio/ogg");
+  });
+
+  // Walks the whole 1s+2s+4s backoff, so it needs more than the 5s default budget.
+  test("downloadAttachment gives up after the retry budget on a persistent 404", async () => {
+    let call = 0;
+    const fetchImpl = (async () => {
+      call++;
+      return { ok: false, status: 404 } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    const err = await client
+      .downloadAttachment("https://chat.example.com/x/File.ogg")
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(ChatwootApiError);
+    expect((err as ChatwootApiError).status).toBe(404);
+    expect(call).toBe(4); // first attempt + 3 retries
+  }, 15_000);
+
+  test("downloadAttachment does NOT retry a non-404 failure", async () => {
+    let call = 0;
+    const fetchImpl = (async () => {
+      call++;
+      return { ok: false, status: 403 } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    await client
+      .downloadAttachment("https://chat.example.com/x/File.ogg")
+      .catch(() => {});
+    expect(call).toBe(1);
+  });
+
   test("throws ChatwootApiError (without body) on non-2xx", async () => {
     const { fetchImpl } = stub(403, { error: "nope" });
     const client = await createChatwootClient(baseConfig, {
