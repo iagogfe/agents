@@ -104,24 +104,36 @@ export function buildAgentGraph({
   return builder.compile(checkpointer ? { checkpointer } : {});
 }
 
+// Some OpenAI-compatible upstreams (seen with gemini-2.5-flash via OpenRouter) leak the model's
+// chain-of-thought into `content` as `<think>…</think>` — often with the OPENING tag already
+// stripped, leaving `reasoning…</think>actual reply`. Delivering that duplicates the answer in the
+// customer chat. Drop complete blocks, then everything up to a stray closing tag.
+function stripLeakedReasoning(text: string): string {
+  let out = text.replace(/<think>[\s\S]*?<\/think>/g, "");
+  const orphan = out.lastIndexOf("</think>");
+  if (orphan !== -1) out = out.slice(orphan + "</think>".length);
+  return out;
+}
+
 // Extracts the assistant's reply text from the final state, normalizing the content (which may
 // be a string or an array of content blocks for some providers) to a plain string.
 export function lastAssistantText(messages: BaseMessage[]): string {
   const last = messages.at(-1);
   if (!last) return "";
   const content = last.content;
-  if (typeof content === "string") return content;
+  if (typeof content === "string") return stripLeakedReasoning(content).trim();
   if (Array.isArray(content)) {
-    return content
-      .map((c) =>
-        typeof c === "string"
-          ? c
-          : c && typeof c === "object" && "text" in c
-            ? String((c as { text: unknown }).text)
-            : "",
-      )
-      .join("")
-      .trim();
+    return stripLeakedReasoning(
+      content
+        .map((c) =>
+          typeof c === "string"
+            ? c
+            : c && typeof c === "object" && "text" in c
+              ? String((c as { text: unknown }).text)
+              : "",
+        )
+        .join(""),
+    ).trim();
   }
   return "";
 }
