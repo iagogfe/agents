@@ -1,3 +1,4 @@
+import { recallTranscription } from "@/modules/stt/transcript-cache";
 import { cleanTranscription, type RenderableMessage } from "./render";
 
 // Pure parser for the Chatwoot conversation-messages REST response (admin-token getMessages). The
@@ -113,7 +114,11 @@ export function parseChatwootMessages(raw: unknown): ChatwootMessageRow[] {
       messageType: messageType(item.message_type),
       private: item.private === true,
       attachmentTypes: attachmentTypesFrom(item.attachments),
-      transcribedText: metaStringFrom(item.attachments, "transcribed_text"),
+      // Fall back to the in-process cache when the meta write-back failed (upstream Chatwoot has no
+      // attachment-meta route) — see modules/stt/transcript-cache.ts.
+      transcribedText:
+        metaStringFrom(item.attachments, "transcribed_text") ??
+        recallTranscription(id),
       imageDescription: metaStringFrom(item.attachments, "image_description"),
       extractedText: metaStringFrom(item.attachments, "extracted_text"),
       attachmentName: fileNameFrom(item.attachments),

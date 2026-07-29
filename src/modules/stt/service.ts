@@ -5,6 +5,7 @@ import { AppError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
+import { rememberTranscription } from "./transcript-cache";
 import { cleanTranscription } from "@/modules/chatwoot/render";
 import {
   emitFlowEvent,
@@ -161,6 +162,9 @@ export async function transcribeInboundAudio(
       { transcribed_text: text },
     );
   } catch (e) {
+    // Upstream Chatwoot has no attachment-meta route (404) — keep the text in-process so the
+    // debounce re-fetch can still recover it, instead of answering a voice note as untranscribed.
+    rememberTranscription(params.messageId, text);
     logger.warn(
       "stt: write-back failed (conv=%s msg=%d): %s",
       String(params.conversationId),
